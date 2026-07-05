@@ -1,0 +1,10 @@
+[project]
+name = "motor-control"
+version = "0.1.0"
+description = "Damiao J6006-2EC control from macOS over USB-CAN"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "pyserial>=3.5",
+    "numpy>=2.0",
+    "motorbridge>=0.4.8",
+]
