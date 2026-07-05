@@ -15,6 +15,7 @@ import os
 import platform
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,6 +134,7 @@ class Adapter:
         self._dev = C.c_void_p()
         self._rx_queue: queue.Queue[RxFrame] = queue.Queue()
         self._lock = threading.Lock()
+        self._shutting_down = False
 
         # Keep a strong ref to the C callback so it isn't GC'd while the C SDK
         # holds the pointer — losing this ref would crash the SDK's callback.
@@ -185,6 +187,10 @@ class Adapter:
 
     def _recv_trampoline(self, _handle, frame_ptr):
         # SDK invokes this from its own thread. Keep it minimal + exception-safe.
+        # During shutdown the SDK can still fire cancelled-transfer callbacks
+        # while its own mutex is being torn down; refuse to touch anything then.
+        if self._shutting_down:
+            return
         try:
             f = frame_ptr.contents
             h = f.head
@@ -220,11 +226,28 @@ class Adapter:
         self._lib.dmcan_device_hook_err_callback(self._dev, self._err_cb_c)
 
     def close(self) -> None:
+        # Signal the trampoline to no-op before we start tearing down. The SDK
+        # keeps invoking recv callbacks while cancelled transfers unwind, and
+        # its own callback-dispatch mutex is being destroyed concurrently — on
+        # Linux this reliably triggers a pthread mutex assertion abort unless
+        # we quiesce first.
+        self._shutting_down = True
         if self._dev:
-            self._lib.dmcan_device_close(self._dev)
+            try:
+                self._lib.dmcan_device_disable_channel(self._dev, 0)
+            except Exception:
+                pass
+            time.sleep(0.2)
+            try:
+                self._lib.dmcan_device_close(self._dev)
+            except Exception:
+                pass
             self._dev = C.c_void_p()
         if self._ctx:
-            self._lib.dmcan_context_destroy(self._ctx)
+            try:
+                self._lib.dmcan_context_destroy(self._ctx)
+            except Exception:
+                pass
             self._ctx = C.c_void_p()
 
     def __enter__(self):
