@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .DS_Store
 DM_Control_Python/
+
+# libdm_device runtime — platform-specific, download per host via setup_runtime.py
+runtime/*.dylib
+runtime/*.so
+runtime/*.dll

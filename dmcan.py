@@ -12,12 +12,26 @@ from __future__ import annotations
 
 import ctypes as C
 import os
+import platform
 import queue
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-_DEFAULT_LIB = Path(__file__).parent / "runtime" / "libdm_device.dylib"
+
+def _default_lib_path() -> Path:
+    root = Path(__file__).parent / "runtime"
+    system = platform.system()
+    if system == "Darwin":
+        return root / "libdm_device.dylib"
+    if system == "Linux":
+        return root / "libdm_device.so"
+    if system == "Windows":
+        return root / "dm_device.dll"
+    raise RuntimeError(f"unsupported platform: {system}")
+
+
+_DEFAULT_LIB = _default_lib_path()
 
 
 class DmcanError(RuntimeError):
