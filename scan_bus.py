@@ -8,6 +8,7 @@ Prints slave_id, master_id (feedback ID), current position, and status.
 This is safe to run any time — the query doesn't enable or move the motor.
 """
 
+import os
 import time
 
 from dmcan import Adapter, USB2CANFD
@@ -55,7 +56,7 @@ def main() -> None:
                       f"pos={fb.pos:+.3f}  err={fb.err_name}  "
                       f"T_mos={fb.t_mos}°C  T_rotor={fb.t_rotor}°C")
     finally:
-        a.close()
+        a._shutting_down = True
 
     print()
     if not found:
@@ -78,6 +79,9 @@ def main() -> None:
         print("WARNING: two or more motors share the same slave (command) ID.")
         print("Commands to that ID would drive both motors simultaneously. Give")
         print("each motor a unique ESC_ID before running multi-motor control.")
+
+    time.sleep(0.3)
+    os._exit(0)
 
 
 if __name__ == "__main__":
