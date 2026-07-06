@@ -25,6 +25,14 @@ ENABLE_CMD   = bytes([0xFF] * 7 + [0xFC])
 DISABLE_CMD  = bytes([0xFF] * 7 + [0xFD])
 SET_ZERO_CMD = bytes([0xFF] * 7 + [0xFE])
 
+# Broadcast "refresh status" — send to CAN ID 0x7FF with this 8-byte payload
+# to query a single motor by slave_id; motor answers via its MST_ID.
+BROADCAST_ID = 0x7FF
+
+
+def refresh_query(slave_id: int) -> bytes:
+    return bytes([slave_id & 0xFF, (slave_id >> 8) & 0xFF, 0xCC, 0, 0, 0, 0, 0])
+
 
 ERR_NAMES = {
     0x0: "OK/disabled",
