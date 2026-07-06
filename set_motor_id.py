@@ -91,16 +91,61 @@ def main() -> None:
 
     esc = args.current_esc
 
-    cur_esc = read_register(a, esc, RID_ESC)
-    cur_mst = read_register(a, esc, RID_MST)
-    print(f"current ESC_ID (RID {RID_ESC}): {f'0x{cur_esc:02X}' if cur_esc is not None else 'no reply'}")
-    print(f"current MST_ID (RID {RID_MST}): {f'0x{cur_mst:02X}' if cur_mst is not None else 'no reply'}")
-
-    if cur_esc is None:
-        print("motor didn't respond to param read — check wiring and --current-esc")
+    # first check the motor is alive at all
+    print(f"pinging motor 0x{esc:02X} with refresh query ...")
+    a.drain()
+    a.send(BROADCAST, damiao.refresh_query(esc))
+    time.sleep(0.3)
+    frames = a.drain()
+    if frames:
+        for f in frames:
+            print(f"  RX id=0x{f.can_id:03X} dlc={f.dlc} data={f.data.hex(' ')}")
+        try:
+            fb = damiao.Feedback.parse(frames[0].data)
+            print(f"  motor alive: pos={fb.pos:+.3f} err={fb.err_name}")
+        except ValueError:
+            pass
+    else:
+        print("  no reply — motor not reachable, check wiring and power")
         a._shutting_down = True
         time.sleep(0.3)
         os._exit(1)
+
+    # try enabling motor first — some firmware requires enable before param access
+    print("enabling motor ...")
+    a.send(esc, damiao.ENABLE_CMD)
+    time.sleep(0.2)
+    a.drain()
+
+    print("reading current registers ...")
+    a.drain()
+    a.send(BROADCAST, param_read(esc, RID_ESC))
+    time.sleep(0.3)
+    frames = a.drain()
+    print(f"  param_read ESC reply frames: {len(frames)}")
+    for f in frames:
+        print(f"    RX id=0x{f.can_id:03X} dlc={f.dlc} data={f.data.hex(' ')}")
+    cur_esc_val = None
+    for f in frames:
+        d = f.data
+        if len(d) >= 8 and d[2] == 0x33 and d[3] == RID_ESC:
+            cur_esc_val = struct.unpack_from("<I", d, 4)[0]
+
+    a.drain()
+    a.send(BROADCAST, param_read(esc, RID_MST))
+    time.sleep(0.3)
+    frames = a.drain()
+    print(f"  param_read MST reply frames: {len(frames)}")
+    for f in frames:
+        print(f"    RX id=0x{f.can_id:03X} dlc={f.dlc} data={f.data.hex(' ')}")
+    cur_mst_val = None
+    for f in frames:
+        d = f.data
+        if len(d) >= 8 and d[2] == 0x33 and d[3] == RID_MST:
+            cur_mst_val = struct.unpack_from("<I", d, 4)[0]
+
+    print(f"current ESC_ID (RID {RID_ESC}): {f'0x{cur_esc_val:02X}' if cur_esc_val is not None else 'no matching reply'}")
+    print(f"current MST_ID (RID {RID_MST}): {f'0x{cur_mst_val:02X}' if cur_mst_val is not None else 'no matching reply'}")
 
     if args.new_mst is not None:
         print(f"writing MST_ID = 0x{args.new_mst:02X} ...")
