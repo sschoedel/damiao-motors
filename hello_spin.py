@@ -9,6 +9,7 @@ libdm_device runtime.
 """
 
 import math
+import os
 import time
 
 from dmcan import Adapter, USB2CANFD
@@ -101,12 +102,10 @@ def main() -> None:
             time.sleep(0.05)
         except Exception:
             pass
-        try:
-            a.disable_channel(0)
-        except Exception:
-            pass
-        a.close()
-        print("motor disabled, channel closed")
+        a._shutting_down = True
+        print("motor disabled, adapter quiescing...")
+        time.sleep(0.3)
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ motorbridge's CLI (installed as a dep):
 """
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -149,13 +150,10 @@ def main() -> None:
                 a.send(m.cfg.slave_id, damiao.DISABLE_CMD)
             except Exception:
                 pass
-        time.sleep(0.05)
-        try:
-            a.disable_channel(0)
-        except Exception:
-            pass
-        a.close()
-        print("motors disabled, channel closed")
+        a._shutting_down = True
+        print("motors disabled, adapter quiescing...")
+        time.sleep(0.3)
+        os._exit(0)
 
 
 if __name__ == "__main__":
