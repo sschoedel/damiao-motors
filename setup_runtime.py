@@ -23,7 +23,7 @@ def resolve() -> tuple[str, str]:
         if machine in ("x86_64", "amd64"):
             return f"{BASE}/linux/x86_64/libdm_device.so", "libdm_device.so"
         if machine in ("aarch64", "arm64"):
-            return f"{BASE}/linux/aarch64/libdm_device.so", "libdm_device.so"
+            return f"{BASE}/linux/arm64/libdm_device.so", "libdm_device.so"
         raise SystemExit(f"unsupported Linux arch: {machine}")
 
     if system == "Darwin":
