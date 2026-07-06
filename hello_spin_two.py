@@ -40,6 +40,8 @@ class MotorCfg:
 MOTORS: list[MotorCfg] = [
     MotorCfg(slave_id=0x01, master_id=0x02, label="A"),
     MotorCfg(slave_id=0x03, master_id=0x04, label="B"),
+    MotorCfg(slave_id=0x05, master_id=0x06, label="C"),
+    MotorCfg(slave_id=0x07, master_id=0x08, label="D"),
 ]
 
 # --- motion params — tame for a first spin ---
