@@ -237,7 +237,7 @@ class Adapter:
                 self._lib.dmcan_device_disable_channel(self._dev, 0)
             except Exception:
                 pass
-            time.sleep(0.2)
+            time.sleep(0.5)
             try:
                 self._lib.dmcan_device_close(self._dev)
             except Exception:
