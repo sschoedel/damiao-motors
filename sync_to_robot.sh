@@ -34,10 +34,21 @@ echo "syncing $REPO_ROOT -> $TARGET:~/$REMOTE_DIR every ${INTERVAL}s"
 echo "local tree is ground truth (remote changes will be overwritten)"
 echo "press ctrl-c to stop"
 
+# macOS ships openrsync, whose per-dir merge filter (:- .gitignore) hides
+# files from the transfer but does NOT protect receiver-side files from
+# --delete. Feeding the root .gitignore as a global exclude list covers the
+# delete pass too, so gitignored files built on the target (e.g.
+# runtime/libdm_device.so from setup_runtime.py) survive syncs.
+EXCLUDE_FROM=()
+if [[ -f "$REPO_ROOT/.gitignore" ]]; then
+    EXCLUDE_FROM=(--exclude-from "$REPO_ROOT/.gitignore")
+fi
+
 while true; do
     # --itemize-changes prints one line per changed file; empty output = no-op
     if CHANGES="$(rsync -az --delete --itemize-changes \
         --exclude ".git" \
+        "${EXCLUDE_FROM[@]}" \
         --filter ":- .gitignore" \
         "$REPO_ROOT/" "$TARGET:$REMOTE_DIR/")"; then
         if [[ -n "$CHANGES" ]]; then
