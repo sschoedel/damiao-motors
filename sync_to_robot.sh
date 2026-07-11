@@ -35,11 +35,16 @@ echo "local tree is ground truth (remote changes will be overwritten)"
 echo "press ctrl-c to stop"
 
 while true; do
-    rsync -az --delete \
+    # --itemize-changes prints one line per changed file; empty output = no-op
+    if CHANGES="$(rsync -az --delete --itemize-changes \
         --exclude ".git" \
         --filter ":- .gitignore" \
-        "$REPO_ROOT/" "$TARGET:$REMOTE_DIR/" \
-        && printf "synced %s\n" "$(date +%H:%M:%S)" \
-        || echo "rsync failed — retrying in ${INTERVAL}s" >&2
+        "$REPO_ROOT/" "$TARGET:$REMOTE_DIR/")"; then
+        if [[ -n "$CHANGES" ]]; then
+            printf "synced %s\n%s\n" "$(date +%H:%M:%S)" "$CHANGES"
+        fi
+    else
+        echo "rsync failed — retrying in ${INTERVAL}s" >&2
+    fi
     sleep "$INTERVAL"
 done
