@@ -8,6 +8,7 @@ First run setup_runtime.py to download the platform-appropriate
 libdm_device runtime.
 """
 
+import argparse
 import math
 import os
 import time
@@ -16,7 +17,7 @@ from dmcan import Adapter, USB2CANFD
 import damiao
 
 
-MOTOR_CAN_ID = 0x01
+DEFAULT_MOTOR_ID = 0x01
 
 # --- motion params — tame for a first spin ---
 KP        = 5.0     # spring stiffness (0-500)
@@ -28,10 +29,10 @@ LOOP_HZ   = 200.0
 PRINT_HZ  = 10.0
 
 
-def read_initial_position(a: Adapter, timeout: float = 1.0) -> float:
+def read_initial_position(a: Adapter, motor_id: int, timeout: float = 1.0) -> float:
     """Send a zero-effort MIT frame, wait for feedback, return current pos."""
     a.drain()
-    a.send(MOTOR_CAN_ID, damiao.pack_mit(0.0, 0.0, 0.0, 0.0, 0.0))
+    a.send(motor_id, damiao.pack_mit(0.0, 0.0, 0.0, 0.0, 0.0))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         frame = a.recv(timeout=0.1)
@@ -59,6 +60,12 @@ def latest_feedback(a: Adapter) -> damiao.Feedback | None:
 
 
 def main() -> None:
+    p = argparse.ArgumentParser(description="MIT-mode sinusoidal spin test")
+    p.add_argument("--motor-id", type=lambda x: int(x, 0), default=DEFAULT_MOTOR_ID,
+                   help=f"motor ESC_ID, hex or decimal (default 0x{DEFAULT_MOTOR_ID:02X})")
+    args = p.parse_args()
+    motor_id = args.motor_id
+
     a = Adapter()
     a.open(device_type=USB2CANFD, index=0)
     a.set_classic_can(channel=0, bitrate=1_000_000, sample_point=0.8)
@@ -66,11 +73,11 @@ def main() -> None:
     print("adapter open + CAN channel enabled")
 
     try:
-        print(f"enabling motor 0x{MOTOR_CAN_ID:02X}")
-        a.send(MOTOR_CAN_ID, damiao.ENABLE_CMD)
+        print(f"enabling motor 0x{motor_id:02X}")
+        a.send(motor_id, damiao.ENABLE_CMD)
         time.sleep(0.1)
 
-        q_center = read_initial_position(a)
+        q_center = read_initial_position(a, motor_id)
 
         dt = 1.0 / LOOP_HZ
         print_every = max(1, int(LOOP_HZ / PRINT_HZ))
@@ -82,7 +89,7 @@ def main() -> None:
                 break
 
             q_des = q_center + AMPL_RAD * math.sin(2 * math.pi * FREQ_HZ * t)
-            a.send(MOTOR_CAN_ID, damiao.pack_mit(q_des, 0.0, KP, KD, 0.0))
+            a.send(motor_id, damiao.pack_mit(q_des, 0.0, KP, KD, 0.0))
 
             if i % print_every == 0:
                 fb = latest_feedback(a)
@@ -98,7 +105,7 @@ def main() -> None:
         print("\ninterrupted")
     finally:
         try:
-            a.send(MOTOR_CAN_ID, damiao.DISABLE_CMD)
+            a.send(motor_id, damiao.DISABLE_CMD)
             time.sleep(0.05)
         except Exception:
             pass

@@ -132,15 +132,23 @@ class Adapter:
         self._bind()
         self._ctx = C.c_void_p()
         self._dev = C.c_void_p()
+        self._owns_ctx = True
         self._rx_queue: queue.Queue[RxFrame] = queue.Queue()
         self._lock = threading.Lock()
         self._shutting_down = False
+
+        self.err_count = 0
 
         # Keep a strong ref to the C callback so it isn't GC'd while the C SDK
         # holds the pointer — losing this ref would crash the SDK's callback.
         self._recv_cb_c = _RecvCallbackT(self._recv_trampoline)
         self._sent_cb_c = _SentCallbackT(lambda *_a: None)
-        self._err_cb_c  = _ErrCallbackT(lambda *_a: None)
+        self._err_cb_c  = _ErrCallbackT(self._err_trampoline)
+
+    def _err_trampoline(self, _handle, _frame_ptr):
+        if self._shutting_down:
+            return
+        self.err_count += 1
 
     def _bind(self):
         L = self._lib
@@ -206,16 +214,23 @@ class Adapter:
 
     # ---- lifecycle ----
     def open(self, device_type: int = USB2CANFD, index: int = 0) -> None:
+        # device_type is ignored: SDK v1.1.0's dmcan_find_devices_with_type
+        # SEGFAULTS on the USB2CANFD_DUAL (PID 0x6632). The generic
+        # dmcan_find_devices handles all Damiao adapter types fine.
         self._lib.dmcan_context_create(C.byref(self._ctx))
         if not self._ctx:
             raise DmcanError("dmcan_context_create returned NULL")
 
-        n = self._lib.dmcan_find_devices_with_type(self._ctx, device_type)
+        n = self._lib.dmcan_find_devices(self._ctx)
         if n <= 0:
-            raise DmcanError(f"no devices of type {device_type} found (n={n})")
+            raise DmcanError(f"no Damiao devices found (n={n})")
         if index >= n:
             raise DmcanError(f"device index {index} out of range (found {n})")
 
+        self._attach(index)
+
+    def _attach(self, index: int) -> None:
+        """Get + open device `index` from an already-enumerated context."""
         if not self._lib.dmcan_device_get(self._ctx, C.byref(self._dev), index):
             raise DmcanError("dmcan_device_get failed")
         if not self._lib.dmcan_device_open(self._dev):
@@ -243,12 +258,12 @@ class Adapter:
             except Exception:
                 pass
             self._dev = C.c_void_p()
-        if self._ctx:
+        if self._ctx and self._owns_ctx:
             try:
                 self._lib.dmcan_context_destroy(self._ctx)
             except Exception:
                 pass
-            self._ctx = C.c_void_p()
+        self._ctx = C.c_void_p()
 
     def __enter__(self):
         return self
@@ -309,3 +324,65 @@ class Adapter:
                 out.append(self._rx_queue.get_nowait())
             except queue.Empty:
                 return out
+
+
+class Bus:
+    """One CAN channel of a (possibly multi-channel) adapter.
+
+    Mirrors the Adapter send/recv API but pins the channel, so callers can
+    treat 'a bus with motors on it' uniformly whether it lives on a
+    single-channel USB2CANFD or one port of a USB2CANFD_DUAL. recv/drain
+    are adapter-wide (the SDK delivers all channels to one callback);
+    route replies by motor id, which must be unique across channels.
+    """
+
+    def __init__(self, adapter: Adapter, channel: int = 0):
+        self.adapter = adapter
+        self.channel = channel
+
+    def configure(self, bitrate: int = 1_000_000,
+                  sample_point: float = 0.8) -> None:
+        self.adapter.set_classic_can(channel=self.channel, bitrate=bitrate,
+                                     sample_point=sample_point)
+        self.adapter.enable_channel(self.channel)
+
+    def send(self, can_id: int, data: bytes, *,
+             ext: bool = False, rtr: bool = False) -> None:
+        self.adapter.send(can_id, data, channel=self.channel,
+                          ext=ext, rtr=rtr)
+
+    def recv(self, timeout: float | None = 0.5) -> RxFrame | None:
+        return self.adapter.recv(timeout=timeout)
+
+    def drain(self) -> list[RxFrame]:
+        return self.adapter.drain()
+
+
+def open_all(device_type: int = USB2CANFD,
+             lib_path: os.PathLike | str | None = None) -> list[Adapter]:
+    """Open every connected adapter of the given type.
+
+    Enumerates USB devices exactly once, in a single SDK context shared by
+    all returned Adapters. Do NOT mix this with additional Adapter.open()
+    calls — a second enumeration probes (and disrupts) devices that are
+    already open.
+    """
+    first = Adapter(lib_path)
+    first._lib.dmcan_context_create(C.byref(first._ctx))
+    if not first._ctx:
+        raise DmcanError("dmcan_context_create returned NULL")
+
+    # generic find — the typed variant segfaults on the dual adapter
+    n = first._lib.dmcan_find_devices(first._ctx)
+    if n <= 0:
+        return []
+
+    adapters: list[Adapter] = []
+    for i in range(n):
+        a = first if i == 0 else Adapter(lib_path)
+        if i > 0:
+            a._ctx = first._ctx
+            a._owns_ctx = False
+        a._attach(i)
+        adapters.append(a)
+    return adapters

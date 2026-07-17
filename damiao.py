@@ -13,16 +13,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-# J6006-2EC parameter limits (datasheet page 8 + cmjang DM_CAN.py Limit_Param[4])
-P_MAX  = 12.5    # rad
-V_MAX  = 45.0    # rad/s
-T_MAX  = 20.0    # Nm
+# MIT-frame scaling limits are per motor model (cmjang DM_CAN.py Limit_Param
+# + motorbridge motor_vendors/damiao/src/motor.rs). Kp/Kd ranges are the
+# same for every model.
+@dataclass(frozen=True)
+class Limits:
+    p_max: float   # rad
+    v_max: float   # rad/s
+    t_max: float   # Nm
+
+
+MODEL_LIMITS = {
+    "J4340":  Limits(12.5, 10.0, 28.0),
+    "J4340P": Limits(12.5, 10.0, 28.0),
+    "J6006":  Limits(12.5, 45.0, 20.0),
+    "J6248P": Limits(12.566, 20.0, 120.0),
+}
+
+DEFAULT_LIMITS = MODEL_LIMITS["J6006"]
+
+# J6006 values kept as module constants for backwards compatibility
+P_MAX  = DEFAULT_LIMITS.p_max
+V_MAX  = DEFAULT_LIMITS.v_max
+T_MAX  = DEFAULT_LIMITS.t_max
 KP_MAX = 500.0
 KD_MAX = 5.0
 
 
 ENABLE_CMD   = bytes([0xFF] * 7 + [0xFC])
 DISABLE_CMD  = bytes([0xFF] * 7 + [0xFD])
+CLEAR_ERR_CMD = bytes([0xFF] * 7 + [0xFB])   # clears latched errors (CommLoss etc.)
 SET_ZERO_CMD = bytes([0xFF] * 7 + [0xFE])
 
 # Broadcast "refresh status" — send to CAN ID 0x7FF with this 8-byte payload
@@ -56,13 +76,14 @@ def _u_to_f(u: int, lo: float, hi: float, bits: int) -> float:
     return u * (hi - lo) / ((1 << bits) - 1) + lo
 
 
-def pack_mit(pos: float, vel: float, kp: float, kd: float, tau: float) -> bytes:
-    """Pack an MIT-mode control frame."""
-    q  = _f_to_u(pos, -P_MAX, P_MAX, 16)
-    dq = _f_to_u(vel, -V_MAX, V_MAX, 12)
+def pack_mit(pos: float, vel: float, kp: float, kd: float, tau: float,
+             limits: Limits = DEFAULT_LIMITS) -> bytes:
+    """Pack an MIT-mode control frame. `limits` must match the motor model."""
+    q  = _f_to_u(pos, -limits.p_max, limits.p_max, 16)
+    dq = _f_to_u(vel, -limits.v_max, limits.v_max, 12)
     kp_u  = _f_to_u(kp,  0.0, KP_MAX, 12)
     kd_u  = _f_to_u(kd,  0.0, KD_MAX, 12)
-    tau_u = _f_to_u(tau, -T_MAX, T_MAX, 12)
+    tau_u = _f_to_u(tau, -limits.t_max, limits.t_max, 12)
     return bytes([
         (q >> 8) & 0xFF,                                           # D[0] p_des[15:8]
         q & 0xFF,                                                  # D[1] p_des[7:0]
@@ -90,7 +111,7 @@ class Feedback:
         return ERR_NAMES.get(self.err_code, f"code=0x{self.err_code:X}")
 
     @classmethod
-    def parse(cls, data: bytes) -> "Feedback":
+    def parse(cls, data: bytes, limits: Limits = DEFAULT_LIMITS) -> "Feedback":
         if len(data) < 8:
             raise ValueError(f"feedback frame too short: {len(data)} bytes")
         motor_id = data[0] & 0x0F
@@ -101,9 +122,9 @@ class Feedback:
         return cls(
             motor_id=motor_id,
             err_code=err,
-            pos=_u_to_f(pos_u, -P_MAX, P_MAX, 16),
-            vel=_u_to_f(vel_u, -V_MAX, V_MAX, 12),
-            tau=_u_to_f(tau_u, -T_MAX, T_MAX, 12),
+            pos=_u_to_f(pos_u, -limits.p_max, limits.p_max, 16),
+            vel=_u_to_f(vel_u, -limits.v_max, limits.v_max, 12),
+            tau=_u_to_f(tau_u, -limits.t_max, limits.t_max, 12),
             t_mos=data[6],
             t_rotor=data[7],
         )

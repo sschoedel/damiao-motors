@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Viser-based MIT-mode command console for Damiao motors.
+
+Run this on the machine with the CAN adapter(s) (e.g. the raspberry pi):
+
+    sudo -E env "PATH=$PATH" uv run motor_gui.py
+
+Then open http://<pi-hostname-or-ip>:8080 in a browser on any machine on
+the network (the 3D viewport is unused for now — everything lives in the
+GUI panel on the right).
+
+On startup the tool opens every connected USB-CANFD adapter and scans each
+bus for motors. Every motor found gets a panel with:
+  - an Enable checkbox (motors start DISABLED; commands stream only while
+    enabled)
+  - pos / vel / torque command sliders, plus Kp / Kd gain sliders
+  - live q / dq / tau feedback readouts
+
+Safety defaults: Kp=0 and tau=0 at startup, so enabling a motor holds it
+with light damping only. The pos slider snaps to the motor's current
+position whenever you enable it, so raising Kp afterwards won't jump.
+"""
+
+import os
+import socket
+import time
+from dataclasses import dataclass, field
+
+import viser
+
+import dmcan
+from dmcan import Adapter
+import damiao
+import robot_config
+
+try:
+    from gpiozero import DigitalOutputDevice
+except ImportError:
+    DigitalOutputDevice = None
+
+RELAY_GPIO = 17   # header pin 11 — drives the 24V motor-power relay
+
+
+# Scan range. Feedback frames only carry the low 4 bits of the ESC_ID, so
+# stick to 0x01..0x0F to keep replies unambiguous.
+SLAVE_RANGE = range(0x01, 0x10)
+SCAN_REPLY_WAIT_S = 0.15
+
+LOOP_HZ = 100.0        # command stream + feedback drain rate
+GUI_HZ = 10.0          # feedback readout refresh rate
+
+# Slider limits — deliberately tamer than the motor's absolute maxima.
+VEL_LIM = 5.0            # rad/s
+TAU_LIM = 2.0            # Nm
+KP_LIM = 200.0           # motor max 500
+KD_LIM = 20.0            # NOTE: protocol caps Kd at 5 — pack_mit clamps
+KP_DEFAULT = 50.0        # fallback for motors not in robot_config
+KD_DEFAULT = 2.0
+
+
+@dataclass
+class MotorUI:
+    adapter: Adapter
+    adapter_idx: int
+    slave_id: int
+    label: str
+    limits: damiao.Limits
+    folder: viser.GuiFolderHandle
+    enable_cb: viser.GuiInputHandle
+    pos: viser.GuiInputHandle
+    vel: viser.GuiInputHandle
+    tau: viser.GuiInputHandle
+    kp: viser.GuiInputHandle
+    kd: viser.GuiInputHandle
+    fb_q: viser.GuiInputHandle
+    fb_dq: viser.GuiInputHandle
+    fb_tau: viser.GuiInputHandle
+    fb_temp: viser.GuiInputHandle
+    fb_err: viser.GuiInputHandle
+    last_fb: damiao.Feedback | None = field(default=None)
+    prev_err: int | None = field(default=None)
+
+
+def open_all_adapters() -> list[Adapter]:
+    adapters = dmcan.open_all()
+    for idx, a in enumerate(adapters):
+        a.set_classic_can(channel=0, bitrate=1_000_000, sample_point=0.8)
+        a.enable_channel(0)
+        print(f"adapter {idx}: open, CAN 1 Mbps")
+    return adapters
+
+
+def scan_motors(a: Adapter) -> list[int]:
+    """Return slave IDs that answer a broadcast refresh query."""
+    found = []
+    for slave in SLAVE_RANGE:
+        a.drain()
+        a.send(damiao.BROADCAST_ID, damiao.refresh_query(slave))
+        deadline = time.monotonic() + SCAN_REPLY_WAIT_S
+        while time.monotonic() < deadline:
+            frame = a.recv(timeout=0.05)
+            if frame is None:
+                continue
+            try:
+                fb = damiao.Feedback.parse(frame.data)
+            except ValueError:
+                continue
+            if fb.motor_id == slave:
+                found.append(slave)
+                break
+    return found
+
+
+def bus_side(slaves: list[int]) -> str | None:
+    """Identify a bus as left/right from the ESC IDs that answered.
+
+    Adapter USB enumeration order is not stable, and the SDK exposes no
+    per-adapter serial number — but the motor IDs are globally unique
+    (left leg 0x01-0x08, right leg 0x09-0x10), so which motors answer
+    tells us which chain this adapter is plugged into.
+    """
+    sides = {"left" if s < 0x09 else "right" for s in slaves}
+    if len(sides) == 1:
+        return sides.pop()
+    if len(sides) > 1:
+        return "MIXED"
+    return None
+
+
+def build_motor_panel(server: viser.ViserServer, a: Adapter,
+                      adapter_idx: int, slave_id: int,
+                      bus_name: str) -> MotorUI:
+    cfg = robot_config.BY_ESC_ID.get(slave_id)
+    if cfg is not None:
+        label = f"{bus_name} · {cfg.name} 0x{slave_id:02X} ({cfg.model})"
+        limits = cfg.limits
+        kp_init, kd_init = cfg.kp_default, cfg.kd_default
+        q_min, q_max = cfg.q_range
+    else:
+        label = f"{bus_name} · motor 0x{slave_id:02X} (unknown)"
+        limits = damiao.DEFAULT_LIMITS
+        kp_init, kd_init = KP_DEFAULT, KD_DEFAULT
+        q_min, q_max = -limits.p_max, limits.p_max
+
+    folder = server.gui.add_folder(label)
+    with folder:
+        enable_cb = server.gui.add_checkbox("enable", initial_value=False)
+        pos = server.gui.add_slider("pos [rad]", min=q_min, max=q_max,
+                                    step=0.01,
+                                    initial_value=min(max(0.0, q_min), q_max))
+        vel = server.gui.add_slider("vel [rad/s]", min=-VEL_LIM, max=VEL_LIM,
+                                    step=0.01, initial_value=0.0)
+        tau = server.gui.add_slider("tau [Nm]", min=-TAU_LIM, max=TAU_LIM,
+                                    step=0.01, initial_value=0.0)
+        kp = server.gui.add_slider("Kp", min=0.0, max=KP_LIM,
+                                   step=0.1, initial_value=kp_init)
+        kd = server.gui.add_slider("Kd", min=0.0, max=KD_LIM,
+                                   step=0.01, initial_value=kd_init)
+        fb_q = server.gui.add_number("q [rad]", initial_value=0.0, disabled=True)
+        fb_dq = server.gui.add_number("dq [rad/s]", initial_value=0.0, disabled=True)
+        fb_tau = server.gui.add_number("tau [Nm]", initial_value=0.0, disabled=True)
+        fb_temp = server.gui.add_text("temp [°C]", initial_value="—",
+                                      disabled=True)
+        fb_err = server.gui.add_text("status", initial_value="—",
+                                     disabled=True)
+
+    m = MotorUI(adapter=a, adapter_idx=adapter_idx, slave_id=slave_id,
+                label=label, limits=limits, folder=folder,
+                enable_cb=enable_cb, pos=pos, vel=vel, tau=tau, kp=kp, kd=kd,
+                fb_q=fb_q, fb_dq=fb_dq, fb_tau=fb_tau, fb_temp=fb_temp,
+                fb_err=fb_err)
+
+    @enable_cb.on_update
+    def _(_event, m=m) -> None:
+        if m.enable_cb.value:
+            # sync the pos slider to where the motor actually is so raising
+            # Kp later doesn't command a jump (clamped into the joint range)
+            if m.last_fb is not None:
+                m.pos.value = min(max(float(round(m.last_fb.pos, 2)),
+                                      m.pos.min), m.pos.max)
+            m.adapter.send(m.slave_id, damiao.ENABLE_CMD)
+            print(f"bus {m.adapter_idx} motor 0x{m.slave_id:02X}: enabled")
+        else:
+            m.adapter.send(m.slave_id, damiao.DISABLE_CMD)
+            print(f"bus {m.adapter_idx} motor 0x{m.slave_id:02X}: disabled")
+
+    return m
+
+
+def main() -> None:
+    adapters = open_all_adapters()
+    if not adapters:
+        raise SystemExit("no USB-CANFD adapters found (need sudo or udev rule?)")
+
+    motors: list[MotorUI] = []
+    server = viser.ViserServer(host="0.0.0.0", port=8080)
+
+    relay = None
+    if DigitalOutputDevice is not None:
+        try:
+            relay = DigitalOutputDevice(RELAY_GPIO, active_high=True,
+                                        initial_value=False)
+        except Exception as e:
+            print(f"relay unavailable (GPIO {RELAY_GPIO}): {e}")
+
+    if relay is not None:
+        relay_cb = server.gui.add_checkbox("motor power (relay)",
+                                           initial_value=False)
+
+        @relay_cb.on_update
+        def _(_event) -> None:
+            if relay_cb.value:
+                relay.on()
+                print("relay ON — motor power up")
+            else:
+                relay.off()
+                print("relay OFF — motor power cut")
+
+    disable_btn = server.gui.add_button("DISABLE ALL")
+    rescan_btn = server.gui.add_button("RESCAN MOTORS")
+    rescan_requested = [True]   # do the initial scan through the same path
+
+    @disable_btn.on_click
+    def _(_event) -> None:
+        for m in motors:
+            m.enable_cb.value = False   # triggers the on_update disable path
+
+    @rescan_btn.on_click
+    def _(_event) -> None:
+        # scanning talks on the bus, so do it from the control loop rather
+        # than viser's callback thread
+        rescan_requested[0] = True
+
+    def do_rescan() -> None:
+        # full reset: disable + tear down every existing panel, then rebuild
+        # from a fresh scan
+        for m in motors:
+            try:
+                m.adapter.send(m.slave_id, damiao.DISABLE_CMD)
+            except Exception:
+                pass
+            m.folder.remove()
+        motors.clear()
+        for idx, a in enumerate(adapters):
+            a.drain()
+            slaves = scan_motors(a)
+            side = bus_side(slaves)
+            if side == "MIXED":
+                print(f"WARNING: adapter {idx} sees motors from BOTH legs "
+                      f"({[hex(s) for s in slaves]}) — CAN chains miswired?")
+            bus_name = side if side in ("left", "right") else f"bus {idx}"
+            print(f"adapter {idx} -> {bus_name}: "
+                  f"motors {[hex(s) for s in slaves] or 'none'}")
+            for slave in slaves:
+                motors.append(build_motor_panel(server, a, idx, slave,
+                                                bus_name))
+
+    try:
+        # UDP "connect" doesn't send anything — just picks the outbound
+        # interface so we can read this machine's LAN address off it
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+    except OSError:
+        lan_ip = socket.gethostbyname(socket.gethostname())
+    print(f"\nserving GUI on http://{lan_ip}:8080 — open this from your mac")
+
+    dt = 1.0 / LOOP_HZ
+    gui_every = max(1, int(LOOP_HZ / GUI_HZ))
+    i = 0
+    try:
+        while True:
+            if rescan_requested[0]:
+                rescan_requested[0] = False
+                do_rescan()
+                if not motors:
+                    print("no motors found — power them on and hit RESCAN")
+
+            loop_start = time.monotonic()
+
+            for a in adapters:
+                for frame in a.drain():
+                    if len(frame.data) < 8:
+                        continue
+                    # motor_id is unscaled — peek it first so we can parse
+                    # with the right model's limits
+                    motor_id = frame.data[0] & 0x0F
+                    for m in motors:
+                        if m.adapter is a and m.slave_id == motor_id:
+                            m.last_fb = damiao.Feedback.parse(frame.data,
+                                                              m.limits)
+                            # log any error-code transition with timestamp —
+                            # twitches should correlate with these
+                            if m.last_fb.err_code != m.prev_err:
+                                if m.prev_err is not None:
+                                    print(f"[{time.monotonic():.3f}] {m.label}: "
+                                          f"status -> {m.last_fb.err_name}")
+                                m.prev_err = m.last_fb.err_code
+                            break
+
+            for m in motors:
+                if m.enable_cb.value:
+                    m.adapter.send(m.slave_id, damiao.pack_mit(
+                        m.pos.value, m.vel.value,
+                        m.kp.value, m.kd.value, m.tau.value,
+                        m.limits))
+
+            if i % gui_every == 0:
+                for m in motors:
+                    # disabled motors don't stream feedback on their own —
+                    # poke them with the passive status query so the
+                    # readouts stay live
+                    if not m.enable_cb.value:
+                        try:
+                            m.adapter.send(damiao.BROADCAST_ID,
+                                           damiao.refresh_query(m.slave_id))
+                        except Exception:
+                            pass
+                    if m.last_fb is not None:
+                        m.fb_q.value = round(m.last_fb.pos, 3)
+                        m.fb_dq.value = round(m.last_fb.vel, 3)
+                        m.fb_tau.value = round(m.last_fb.tau, 3)
+                        m.fb_temp.value = (f"mos {m.last_fb.t_mos}  "
+                                           f"rotor {m.last_fb.t_rotor}")
+                        m.fb_err.value = m.last_fb.err_name
+
+            for idx, a in enumerate(adapters):
+                if a.err_count:
+                    print(f"[{time.monotonic():.3f}] bus {idx}: "
+                          f"{a.err_count} CAN error frame(s)")
+                    a.err_count = 0
+
+            # flag control-loop stalls (GC pauses, viser hiccups, USB
+            # backpressure) — twitches that correlate with these point at
+            # host-side timing rather than power/wiring
+            elapsed = time.monotonic() - loop_start
+            if elapsed > 3 * dt:
+                print(f"[{time.monotonic():.3f}] loop overrun: "
+                      f"{elapsed * 1000:.1f} ms (target {dt * 1000:.0f} ms)")
+            i += 1
+            time.sleep(dt)
+    except KeyboardInterrupt:
+        print("\nshutting down")
+    finally:
+        for m in motors:
+            try:
+                m.adapter.send(m.slave_id, damiao.DISABLE_CMD)
+            except Exception:
+                pass
+        if relay is not None:
+            try:
+                relay.off()
+                print("relay OFF")
+            except Exception:
+                pass
+        for a in adapters:
+            a._shutting_down = True
+        time.sleep(0.3)
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
