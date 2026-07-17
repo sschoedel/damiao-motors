@@ -51,6 +51,7 @@ import damiao
 import robot_config
 import crsf_input
 import imu_interface
+import policy_runtime
 import joint_calibration
 import robot_viz
 from lqr_runtime import (
@@ -66,7 +67,7 @@ from lqr_runtime import (
 # button breaks the line. No software power control (GPIO 17 retired).
 
 SLAVE_RANGE = range(0x01, 0x10)
-SCAN_REPLY_WAIT_S = 0.15
+SCAN_WINDOW_S = 2.0        # per-adapter reply collection window
 
 LOOP_HZ = 100.0        # command stream + feedback drain rate
 GUI_HZ = 10.0          # feedback readout refresh rate
@@ -95,15 +96,16 @@ JOY_DEADBAND = 0.06
 # "balance" cannot arm the robot at power-on). Positions: -1/0/+1 for
 # lo/mid/hi. Flip switches while watching the ch5-ch8 readout in the
 # joystick status line to discover your transmitter's channel order,
-# then adjust here. Valid actions: damp / stand / balance / sit / enable
-# ("enable" = clear errors + enable all motors, same as the GUI button).
+# then adjust here. Valid actions: damp / stand / balance / policy / sit /
+# enable ("enable" = clear errors + enable all motors, same as the GUI
+# button; "policy" = balance with the RL locomotion policy).
 JOY_MODE_SWITCHES = {
     ("ch5", 1): "enable",
     ("ch5", -1): "damp",
     ("ch7", 1): "stand",
     ("ch7", -1): "sit",
     ("ch6", 1): "balance",
-    ("ch6", -1): "damp",
+    ("ch6", -1): "policy",
 }
 
 
@@ -177,24 +179,35 @@ def open_hardware() -> tuple[list[Adapter], list[dmcan.Bus]]:
 
 
 def scan_motors(a: dmcan.Bus) -> list[int]:
-    """Return slave IDs that answer a broadcast refresh query."""
-    found = []
+    """Return slave IDs that answer a broadcast refresh query.
+
+    All queries go out back-to-back (15 CAN frames ≈ 2 ms at 1 Mbps) and
+    the replies are collected in a single window — waiting out a per-slave
+    reply timeout serializes badly when the adapter read path blocks in
+    ~100 ms quanta.
+
+    Replies are filtered by rx channel: on a dual adapter both channels
+    share one rx queue, and without the filter a motor answering on CAN 1
+    would also be "found" by the CAN 2 scan.
+    """
+    a.drain()
     for slave in SLAVE_RANGE:
-        a.drain()
         a.send(damiao.BROADCAST_ID, damiao.refresh_query(slave))
-        deadline = time.monotonic() + SCAN_REPLY_WAIT_S
-        while time.monotonic() < deadline:
-            frame = a.recv(timeout=0.05)
-            if frame is None:
-                continue
-            try:
-                fb = damiao.Feedback.parse(frame.data)
-            except ValueError:
-                continue
-            if fb.motor_id == slave:
-                found.append(slave)
-                break
-    return found
+    found: set[int] = set()
+    deadline = time.monotonic() + SCAN_WINDOW_S
+    while time.monotonic() < deadline and len(found) < len(SLAVE_RANGE):
+        frame = a.recv(timeout=0.05)
+        if frame is None:
+            continue
+        if frame.channel != a.channel:
+            continue
+        try:
+            fb = damiao.Feedback.parse(frame.data)
+        except ValueError:
+            continue
+        if fb.motor_id in SLAVE_RANGE:
+            found.add(fb.motor_id)
+    return sorted(found)
 
 
 def bus_side(slaves: list[int]) -> str | None:
@@ -390,6 +403,10 @@ def main() -> None:
         runtime = RobotRuntime(TableController(TABLES_FILE), dt=1.0 / LOOP_HZ)
     except Exception as e:  # tables missing/corrupt — robot mode unavailable
         tables_err = str(e)
+    if runtime is not None:
+        # RL locomotion policy (mjlab ONNX export); None if onnxruntime or
+        # the .onnx file is missing — "balance (policy)" is then locked out
+        runtime.policy = policy_runtime.create(loop_hz=LOOP_HZ)
 
     estop_btn = server.gui.add_button("DAMP ALL", color="red")
     disable_btn = server.gui.add_button("DISABLE ALL")
@@ -406,7 +423,8 @@ def main() -> None:
         b_enable_all = server.gui.add_button("enable all motors")
         b_damp = server.gui.add_button("damp")
         b_stand = server.gui.add_button("stand")
-        b_balance = server.gui.add_button("balance")
+        b_balance = server.gui.add_button("balance (LQR)")
+        b_policy = server.gui.add_button("balance (policy)")
         b_sit = server.gui.add_button("sit")
         cb_joy = server.gui.add_checkbox(
             "joystick control (right stick)", initial_value=True)
@@ -543,6 +561,7 @@ def main() -> None:
     b_damp.on_click(lambda _e: mode_req.append("damp"))
     b_stand.on_click(lambda _e: mode_req.append("stand"))
     b_balance.on_click(lambda _e: mode_req.append("balance"))
+    b_policy.on_click(lambda _e: mode_req.append("policy"))
     b_sit.on_click(lambda _e: mode_req.append("sit"))
 
     def _zero(_e):
@@ -815,9 +834,13 @@ def main() -> None:
                         trip_md.content = ("🔴 **cannot arm — "
                                            + "; ".join(detail) + "**")
                         continue
-                    if req == "balance" and (imu is None or
+                    if req in ("balance", "policy") and (imu is None or
                                              not getattr(imu, "available", False)):
                         trip_md.content = "🔴 **no IMU driver — balance locked out**"
+                        continue
+                    if req == "policy" and runtime.policy is None:
+                        trip_md.content = ("🔴 **no policy loaded — check "
+                                           "onnxruntime + policy .onnx file**")
                         continue
                     # stand/sit/balance all track sim-frame joint targets:
                     # without calibrated zero offsets the motor-frame
@@ -906,7 +929,7 @@ def main() -> None:
                     if cb_spike.value:
                         q, dq = spike_filter.apply(q, dq)
                     imu_s = imu.read() if imu is not None else None
-                    if imu_s is None and runtime.mode == "balance":
+                    if imu_s is None and runtime.mode in ("balance", "policy"):
                         runtime.trip("IMU LOST")
                     quat = imu_s[0] if imu_s else np.array([1.0, 0, 0, 0])
                     gyro = imu_s[1] if imu_s else np.zeros(3)
@@ -937,7 +960,8 @@ def main() -> None:
                 # mode (e.g. hoisted IMU tilt-sign checks in manual mode).
                 # Skipped while balancing — the control tick refreshes it.
                 if (runtime is not None
-                        and not (mode == "robot" and runtime.mode == "balance")
+                        and not (mode == "robot"
+                                 and runtime.mode in ("balance", "policy"))
                         and calibrator[0] is None):
                     jm_prev = joint_map()
                     imu_s = imu.read() if imu is not None else None
